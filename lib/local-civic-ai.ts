@@ -62,6 +62,15 @@ async function getClassifier() {
   return classifierPromise;
 }
 
+// Begin the one-time model download before the citizen presses Analyze. The
+// promise is shared with analyzeCivicImage, so this never downloads twice.
+export function preloadCivicClassifier() {
+  void getClassifier().catch(() => {
+    // Analysis will surface a useful error if the retry also fails.
+    classifierPromise = null;
+  });
+}
+
 function scorePercent(score: number) {
   return Math.max(0, Math.min(99, Math.round(score * 100)));
 }

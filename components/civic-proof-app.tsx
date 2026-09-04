@@ -46,7 +46,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { analyzeCivicImage } from "@/lib/local-civic-ai";
+import { analyzeCivicImage, preloadCivicClassifier } from "@/lib/local-civic-ai";
 
 type Props = { screen: string };
 type Category =
@@ -175,6 +175,17 @@ const getLocalCitizen = (): AuthUser | null => {
   }
 };
 
+// Keep all citizen-facing totals and lists tied to the signed-in account.
+// Invalid legacy storage entries are ignored rather than breaking the page.
+const getCitizenCases = (): Case[] => {
+  const citizen = getLocalCitizen();
+  if (!citizen) return [];
+  return getSavedCases().filter((item): item is Case =>
+    Boolean(item) && typeof item === "object" &&
+    ((item as any).user_id === citizen.id || (item as any).email === citizen.email)
+  );
+};
+
 
 /* --- AUTH + CITIZEN ASSISTANT --- */
 type AuthUser = { id: string; email: string; name?: string };
@@ -283,8 +294,7 @@ function CitizenChatbot({ compactOnly = false }: { compactOnly?: boolean }) {
     setMessages(m=>[...m,{from:"user",text:clean}]);
     setBusy(true);
     try {
-      const citizen = getLocalCitizen();
-      const cases = getSavedCases().filter((x:any)=>!citizen || !x.user_id || x.user_id===citizen.id);
+      const cases = getCitizenCases();
       const t=clean.toLowerCase();
       let answer="Try one of the quick questions below, or ask me about reporting, complaint status, location, or proof verification.";
       if(/report|pothole|garbage|streetlight|drain|water|issue|complaint/.test(t)) {
@@ -424,7 +434,7 @@ function Nav() {
 function SideMenu({open,onClose}:{open:boolean;onClose:()=>void}) {
   const r=useRouter();
   const citizen=getLocalCitizen();
-  const cases=getSavedCases().filter((x:any)=>!citizen || !x.user_id || x.user_id===citizen.id);
+  const cases=getCitizenCases();
   const go=(path:string)=>{onClose();r.push(path);};
   if(!open) return null;
   return <div className="absolute inset-0 z-[90]">
@@ -503,7 +513,12 @@ function Metric({
 
 function Home() {
   const [cases,setCases]=useState<Case[]>([]);
-  useEffect(()=>{const load=()=>setCases(getSavedCases());load();window.addEventListener("civicproof:cases-updated",load);return()=>window.removeEventListener("civicproof:cases-updated",load)},[]);
+  useEffect(()=>{
+    const load=()=>setCases(getCitizenCases());
+    load();
+    window.addEventListener("civicproof:cases-updated",load);
+    return()=>window.removeEventListener("civicproof:cases-updated",load);
+  },[]);
   const resolved=cases.filter(c=>String(c.status).toLowerCase()==="resolved").length;
   const active=cases.length-resolved;
   return (
@@ -606,7 +621,9 @@ function Report() {
   const capturePhoto = () => {
     const video = videoRef.current;
     if (!video || !video.videoWidth) return;
-    const max = 1600;
+    // CLIP reduces every image before inference. Keeping the evidence image at
+    // 1024px preserves useful detail while avoiding a costly large-image decode.
+    const max = 1024;
     const scale = Math.min(1, max / Math.max(video.videoWidth, video.videoHeight));
     const canvas = document.createElement("canvas");
     canvas.width = Math.round(video.videoWidth * scale);
@@ -614,8 +631,32 @@ function Report() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    up({ photo: true, imageUrl: canvas.toDataURL("image/jpeg", 0.86) });
+    up({ photo: true, imageUrl: canvas.toDataURL("image/jpeg", 0.82) });
+    preloadCivicClassifier();
     stopCamera();
+  };
+
+  const uploadPhoto = (file: File) => {
+    const image = document.createElement("img");
+    const objectUrl = URL.createObjectURL(file);
+    image.onload = () => {
+      const max = 1024;
+      const scale = Math.min(1, max / Math.max(image.naturalWidth, image.naturalHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      up({ photo: true, imageUrl: canvas.toDataURL("image/jpeg", 0.82) });
+      preloadCivicClassifier();
+      URL.revokeObjectURL(objectUrl);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      setAnalysisError("That image could not be read. Please choose a JPG, PNG, or WebP photo.");
+    };
+    image.src = objectUrl;
   };
 
   useEffect(() => () => stopCamera(), []);
@@ -658,11 +699,18 @@ function Report() {
               <button onClick={startCamera} className="absolute right-4 bottom-4 rounded-xl bg-white/95 px-3 py-2 text-[10px] font-black text-slate-800 shadow">Retake</button>
             </div>
           ) : (
-            <button onClick={startCamera} className="flex w-full flex-col items-center justify-center p-7 text-center active:bg-slate-50">
+            <div className="p-7 text-center">
+              <button onClick={startCamera} className="flex w-full flex-col items-center justify-center active:bg-slate-50">
               <span className="grid h-16 w-16 place-items-center rounded-full bg-blue-600 text-white shadow-lg"><Camera size={30} /></span>
               <h2 className="mt-4 text-base font-black text-slate-900">Open Live Camera</h2>
               <p className="mt-1 max-w-[260px] text-[11px] leading-relaxed text-slate-500">Take a fresh photo of the civic problem. CivicProof AI will analyze the actual image.</p>
-            </button>
+              </button>
+              <label className="mx-auto mt-4 flex w-fit cursor-pointer items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-[11px] font-black text-slate-700 shadow-sm">
+                <Upload size={15}/> Upload photo
+                <input type="file" accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(e) => { const file = e.target.files?.[0]; if (file) uploadPhoto(file); e.currentTarget.value = ""; }} />
+              </label>
+              <p className="mt-2 text-[9px] font-medium text-slate-400">Photos are resized on your device before analysis for faster results.</p>
+            </div>
           )}
         </div>
 
@@ -934,7 +982,7 @@ function Created() {
 function Complaints() {
   const [allCases, setAllCases] = useState<any[]>([]);
   const [tab,setTab]=useState("All");
-  useEffect(() => { const load=()=>{const citizen=getLocalCitizen();setAllCases(getSavedCases().filter((x:any)=>!citizen||!x.user_id||x.user_id===citizen.id).map((x:any)=>({...x,date:x.date||"Just now",photo:Boolean(x.imageUrl),color:String(x.status).toLowerCase().includes("resolved")?"green":"blue"})));};load();window.addEventListener("civicproof:cases-updated",load);return()=>window.removeEventListener("civicproof:cases-updated",load)}, []);
+  useEffect(() => { const load=()=>setAllCases(getCitizenCases().map((x:any)=>({...x,date:x.date||"Just now",photo:Boolean(x.imageUrl),color:String(x.status).toLowerCase().includes("resolved")?"green":"blue"})));load();window.addEventListener("civicproof:cases-updated",load);return()=>window.removeEventListener("civicproof:cases-updated",load)}, []);
   const visible=allCases.filter(c=>tab==="All"||(tab==="Active"&&!String(c.status).toLowerCase().includes("resolved"))||(tab==="Resolved"&&String(c.status).toLowerCase().includes("resolved")));
   const support=(id:string)=>{const arr=getSavedCases();const n=arr.map((c:any)=>c.id===id?{...c,community_support:(c.community_support||0)+1}:c);localStorage.setItem(CASES_KEY,JSON.stringify(n));window.dispatchEvent(new Event("civicproof:cases-updated"));};
   return <Shell className="bg-slate-50"><Header title="My Complaints"/><section className="px-5 pt-1"><div className="rounded-3xl bg-slate-900 p-4 text-white"><p className="text-[10px] font-black uppercase tracking-wider text-cyan-300">Civic accountability</p><h2 className="mt-1 text-lg font-black">Track every case to closure</h2><p className="mt-1 text-[10px] text-slate-300">See progress, evidence, community support and verification.</p></div><div className="mt-3 grid grid-cols-3 gap-1.5">{["All","Active","Resolved"].map(x=><button key={x} onClick={()=>setTab(x)} className={cn("rounded-xl py-2 text-[10px] font-black",tab===x?"bg-[#005a7a] text-white":"bg-white border border-slate-200 text-slate-500")}>{x}</button>)}</div>{visible.length===0?<div className="mt-3 rounded-3xl bg-white p-7 text-center border border-slate-100 shadow-sm"><FileCheck2 className="mx-auto text-slate-300" size={38}/><h3 className="mt-3 text-sm font-black">No complaints here</h3><p className="mt-1 text-[11px] text-slate-500">Use Report to capture a real civic problem.</p><Link href="/report" className="mt-4 inline-flex rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-black text-white">Report an issue</Link></div>:<div className="mt-3 space-y-3">{visible.map(x=><div key={x.id} className="rounded-2xl bg-white p-3.5 shadow-sm border border-slate-100"><div className="flex items-start gap-3"><span className={cn("grid h-10 w-10 shrink-0 place-items-center rounded-xl",colors[x.color])}><CircleDot size={18}/></span><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><p className="truncate text-xs font-black text-slate-900">{x.title}</p><Badge c={x.color}>{x.status}</Badge></div><p className="mt-1 text-[10px] text-slate-400">{x.id} · {x.date}</p><div className="mt-3 grid grid-cols-4 gap-1 text-center text-[8px] font-bold"><span className="rounded-lg bg-emerald-50 p-1 text-emerald-700">✓ Submitted</span><span className="rounded-lg bg-blue-50 p-1 text-blue-700">{String(x.status).toLowerCase().includes("assigned")?"✓":"•"} Assigned</span><span className="rounded-lg bg-amber-50 p-1 text-amber-700">{String(x.status).toLowerCase().includes("resolved")?"✓":"•"} Repair</span><span className="rounded-lg bg-violet-50 p-1 text-violet-700">{String(x.status).toLowerCase().includes("resolved")?"✓":"•"} Verify</span></div><div className="mt-2 flex items-center justify-between"><span className="flex items-center gap-1 text-[9px] font-bold text-slate-500"><Users size={12}/> {x.community_support||0} support</span><button onClick={()=>support(x.id)} className="rounded-lg bg-slate-100 px-2 py-1 text-[9px] font-black text-slate-700">Support issue +1</button></div>{x.duplicate_of&&<p className="mt-2 rounded-lg bg-amber-50 p-2 text-[9px] font-bold text-amber-800">Similar nearby case detected: {x.duplicate_of}. This helps reduce duplicate complaints.</p>}</div></div></div>)}</div>}</section></Shell>;
